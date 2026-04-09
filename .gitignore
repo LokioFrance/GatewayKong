@@ -1,0 +1,14 @@
+# Fichier généré par deploy.sh (contient la clé API en clair)
+kong.yml
+
+# Secrets
+.env
+*.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/

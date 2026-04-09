@@ -1,0 +1,219 @@
+_format_version: "3.0"
+_transform: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kong DB-less declarative configuration — Lokio
+# Généré dynamiquement par deploy.sh à partir de ce template.
+# NE PAS éditer kong.yml directement — modifier kong.yml.template.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Plugins globaux ───────────────────────────────────────────────────────────
+plugins:
+
+  # Limitation de débit globale
+  - name: rate-limiting
+    config:
+      minute: 300
+      hour: 10000
+      policy: local
+      fault_tolerant: true
+
+  # Remplacement du header Host pour passer le ALLOWED_HOSTS Django
+  # Kong utilise l'IP interne (172.17.0.x) comme Host par défaut → rejeté par Django
+  - name: request-transformer
+    config:
+      replace:
+        headers:
+          - "Host: localhost"
+
+  # Validation JWT utilisateur + injection token de service
+  # S'applique à TOUTES les routes sauf /auth/* (routes publiques)
+  - name: pre-function
+    config:
+      access:
+        - |
+          -- ══════════════════════════════════════════════════════════════════
+          -- Lokio Gateway — Auth middleware
+          -- 1. Bypass pour les routes publiques (/auth/*)
+          -- 2. Validation du JWT utilisateur (signé par area / AREA_JWT_SECRET)
+          -- 3. Injection du token de service selon la route ciblée
+          -- ══════════════════════════════════════════════════════════════════
+
+          local path = kong.request.get_path()
+
+          -- Routes publiques : pas de validation JWT
+          if path:find("^/auth/") then
+            return
+          end
+
+          -- ── 1. Récupération et parsing du JWT utilisateur ────────────────
+          local auth_header = kong.request.get_header("Authorization")
+          if not auth_header then
+            return kong.response.exit(401, { message = "Authentification requise. Connectez-vous via POST /auth/token" })
+          end
+
+          local token = auth_header:match("^[Bb]earer%s+(.+)$")
+          if not token then
+            return kong.response.exit(401, { message = "Format invalide. Attendu : Authorization: Bearer <token>" })
+          end
+
+          local jwt_parser = require("kong.plugins.jwt.jwt_parser")
+          local jwt_obj, parse_err = jwt_parser:new(token)
+          if parse_err then
+            return kong.response.exit(401, { message = "Token malformé" })
+          end
+
+          -- ── 2. Vérification de la signature ─────────────────────────────
+          local secret = os.getenv("AREA_JWT_SECRET")
+          if not secret or secret == "" then
+            kong.log.err("AREA_JWT_SECRET non défini dans l'environnement Kong")
+            return kong.response.exit(500, { message = "Erreur de configuration du gateway" })
+          end
+
+          local sig_ok, sig_err = jwt_obj:verify_signature(secret)
+          if not sig_ok then
+            return kong.response.exit(401, { message = "Signature du token invalide" })
+          end
+
+          -- ── 3. Vérifications des claims ──────────────────────────────────
+          -- Doit être un access token (pas un refresh token)
+          if jwt_obj.claims.token_type ~= "access" then
+            return kong.response.exit(401, { message = "Type de token invalide (access requis)" })
+          end
+
+          -- Vérification de l'expiration
+          local exp = jwt_obj.claims.exp
+          if not exp or exp < ngx.time() then
+            return kong.response.exit(401, { message = "Token expiré — rafraîchissez via POST /auth/token/refresh" })
+          end
+
+          -- ── 4. Transmission de l'identité utilisateur au microservice ────
+          local user_id = jwt_obj.claims.user_id
+          if user_id then
+            kong.service.request.set_header("X-User-Id", tostring(user_id))
+          end
+
+          -- ── 5. Injection du token de service selon la route ──────────────
+          local service_name
+          if path:find("^/api/areas", 1, true) or path:find("^/api/sub%-areas", 1, true) then
+            service_name = "area"
+          elseif path:find("^/api/items", 1, true)
+              or path:find("^/api/item%-infos", 1, true)
+              or path:find("^/api/objects", 1, true) then
+            service_name = "boxify"
+          elseif path:find("^/api/identifiers", 1, true)
+              or path:find("^/api/typeids", 1, true) then
+            service_name = "marko"
+          end
+
+          if service_name then
+            local token_path = "/tokens/" .. service_name .. ".token"
+            local f = io.open(token_path, "r")
+            if f then
+              local svc_token = f:read()
+              f:close()
+              if svc_token and #svc_token > 0 then
+                kong.service.request.set_header(
+                  "Authorization",
+                  "Bearer " .. svc_token:gsub("[\n\r%s]+", "")
+                )
+              else
+                kong.log.warn("Token vide pour le service : " .. service_name)
+              end
+            else
+              kong.log.warn("Fichier token introuvable : " .. token_path)
+            end
+          end
+
+# ── Services et routes ────────────────────────────────────────────────────────
+services:
+
+  # ── Auth — Authentification utilisateur (routes publiques) ───────────────
+  # Ces routes ne passent PAS par le middleware JWT (bypass dans le pre-function)
+  - name: auth-service
+    url: __AREA_UPSTREAM__
+    connect_timeout: 10000
+    read_timeout: 10000
+    write_timeout: 10000
+    routes:
+      # Login : POST /auth/token → area:/api/token/
+      - name: auth-login
+        paths:
+          - /auth/token
+        methods:
+          - POST
+        strip_path: false
+        plugins:
+          - name: request-transformer
+            config:
+              replace:
+                uri: /api/token/
+
+      # Refresh : POST /auth/token/refresh → area:/api/token/refresh/
+      - name: auth-refresh
+        paths:
+          - /auth/token/refresh
+        methods:
+          - POST
+        strip_path: false
+        plugins:
+          - name: request-transformer
+            config:
+              replace:
+                uri: /api/token/refresh/
+
+  # ── Area — zones & sous-zones ─────────────────────────────────────────────
+  - name: area-service
+    url: __AREA_UPSTREAM__
+    connect_timeout: 10000
+    read_timeout: 30000
+    write_timeout: 30000
+    routes:
+      - name: area-areas
+        paths:
+          - /api/areas
+        strip_path: false
+
+      - name: area-sub-areas
+        paths:
+          - /api/sub-areas
+        strip_path: false
+
+  # ── Boxify — boîtes & objets ──────────────────────────────────────────────
+  - name: boxify-service
+    url: __BOXIFY_UPSTREAM__
+    connect_timeout: 10000
+    read_timeout: 30000
+    write_timeout: 30000
+    routes:
+      - name: boxify-item-infos
+        paths:
+          - /api/item-infos
+        strip_path: false
+
+      - name: boxify-items
+        paths:
+          - /api/items
+        strip_path: false
+
+      - name: boxify-objects
+        paths:
+          - /api/objects
+        strip_path: false
+
+  # ── Marko — QR codes & barcodes ───────────────────────────────────────────
+  - name: marko-service
+    url: __MARKO_UPSTREAM__
+    connect_timeout: 10000
+    read_timeout: 30000
+    write_timeout: 30000
+    routes:
+      - name: marko-identifiers
+        paths:
+          - /api/identifiers
+        strip_path: false
+
+      - name: marko-typeids
+        paths:
+          - /api/typeids
+        strip_path: false
