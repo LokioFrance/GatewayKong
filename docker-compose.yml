@@ -1,0 +1,70 @@
+services:
+
+  # ── Token Manager ─────────────────────────────────────────────────────────
+  # Authentifie sur chaque microservice et maintient les tokens à jour
+  # dans le volume partagé /tokens/
+  token-manager:
+    build: ./token-manager
+    container_name: kong-token-manager
+    restart: unless-stopped
+    environment:
+      # URLs internes construites avec l'IP IPv4 du bridge Docker (injectée par deploy.sh)
+      # Cela évite les problèmes de résolution IPv6 de host.docker.internal sur Linux
+      AREA_URL: "${AREA_INTERNAL_URL}"
+      AREA_SERVICE_USERNAME: "${AREA_SERVICE_USERNAME}"
+      AREA_SERVICE_PASSWORD: "${AREA_SERVICE_PASSWORD}"
+      BOXIFY_URL: "${BOXIFY_INTERNAL_URL}"
+      BOXIFY_SERVICE_USERNAME: "${BOXIFY_SERVICE_USERNAME}"
+      BOXIFY_SERVICE_PASSWORD: "${BOXIFY_SERVICE_PASSWORD}"
+      MARKO_URL: "${MARKO_INTERNAL_URL}"
+      MARKO_SERVICE_USERNAME: "${MARKO_SERVICE_USERNAME}"
+      MARKO_SERVICE_PASSWORD: "${MARKO_SERVICE_PASSWORD}"
+      REFRESH_INTERVAL: "${TOKEN_REFRESH_INTERVAL:-3300}"
+    volumes:
+      - tokens:/tokens
+    healthcheck:
+      # Sain dès qu'au moins un token est disponible
+      test: ["CMD", "sh", "-c", "ls /tokens/*.token 2>/dev/null | grep -q ."]
+      interval: 10s
+      timeout: 5s
+      retries: 18        # ~3 min d'attente max
+      start_period: 10s
+
+  # ── Kong Gateway ──────────────────────────────────────────────────────────
+  kong:
+    image: kong:3.9
+    container_name: kong
+    restart: unless-stopped
+    depends_on:
+      token-manager:
+        condition: service_healthy
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/declarative/kong.yml
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: "0.0.0.0:8001"
+      KONG_PROXY_LISTEN: "0.0.0.0:8000"
+      KONG_LOG_LEVEL: notice
+      # Secret JWT partagé avec le service area (= DJANGO_SECRET_KEY de area)
+      # Utilisé par le plugin pre-function pour valider les tokens utilisateurs
+      AREA_JWT_SECRET: "${AREA_JWT_SECRET}"
+    volumes:
+      - ./kong.yml:/kong/declarative/kong.yml:ro
+      - tokens:/tokens:ro
+    ports:
+      - "${KONG_PROXY_PORT:-8000}:8000"
+      - "${KONG_ADMIN_PORT:-8900}:8001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  tokens:
